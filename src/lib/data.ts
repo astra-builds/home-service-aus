@@ -1,5 +1,5 @@
 import { and, asc, desc, eq, sql } from "drizzle-orm";
-import { db } from "@/db";
+import { db, hasDatabase } from "@/db";
 import {
   bookings,
   commsLog,
@@ -10,9 +10,13 @@ import {
   type Project,
 } from "@/db/schema";
 import { ensureSeed } from "@/db/seed";
-import { enquiryReference, leadScore, quoteReference } from "./estimate";
+import { enquiryReference, leadScore } from "./estimate";
+import { getMemoryStore } from "./memory-store";
 
 export async function getProjects(): Promise<Project[]> {
+  if (!hasDatabase) {
+    return [...getMemoryStore().projects].sort((a, b) => a.sortOrder - b.sortOrder);
+  }
   try {
     await ensureSeed();
     return await db.select().from(projects).orderBy(asc(projects.sortOrder));
@@ -22,6 +26,9 @@ export async function getProjects(): Promise<Project[]> {
 }
 
 export async function getProject(slug: string): Promise<Project | undefined> {
+  if (!hasDatabase) {
+    return getMemoryStore().projects.find((p) => p.slug === slug);
+  }
   try {
     await ensureSeed();
     const rows = await db.select().from(projects).where(eq(projects.slug, slug)).limit(1);
@@ -80,6 +87,73 @@ export async function createEnquiry(input: EnquiryInput) {
 
   const status = input.estimateLow ? "planning" : "new";
   const stage = input.estimateLow ? "Cost plan in progress" : "New enquiry";
+
+  if (!hasDatabase) {
+    const store = getMemoryStore();
+    const id = ++store.nextId;
+    const now = new Date();
+    const row = {
+      id,
+      reference,
+      name: input.name,
+      email: input.email,
+      phone: input.phone ?? "",
+      suburb: input.suburb ?? "",
+      projectType: input.projectType ?? "",
+      scope: input.scope ?? "",
+      budgetBand: input.budgetBand ?? "",
+      timing: input.timing ?? "",
+      message: input.message ?? "",
+      channel: input.channel ?? "web",
+      source: input.source ?? "website",
+      score,
+      grade,
+      estimateLow: input.estimateLow ?? null,
+      estimateHigh: input.estimateHigh ?? null,
+      confidence: input.confidence ?? null,
+      quoteRef: input.quoteRef ?? null,
+      status,
+      stage,
+      owner: grade === "hot" ? "Priya Raman" : "Jess Navarro",
+      nextActionAt: new Date(Date.now() + (NEXT_ACTIONS[status] ?? 60) * 60000),
+      createdAt: now,
+    };
+    store.enquiries.unshift(row);
+    store.events.unshift(
+      {
+        id: ++store.nextId,
+        enquiryId: id,
+        kind: "received",
+        label: "Enquiry received",
+        detail: `Submitted from the ${input.source ?? "website"}${input.suburb ? ` · ${input.suburb}` : ""}.`,
+        actor: "Website",
+        channel: "web",
+        minutesAfter: 0,
+        createdAt: now,
+      },
+      {
+        id: ++store.nextId,
+        enquiryId: id,
+        kind: "auto",
+        label: "Acknowledged by SMS + email",
+        detail: `Reference ${reference} issued with an expected reply time and what happens next.`,
+        actor: "Studio desk",
+        channel: "sms",
+        minutesAfter: 1,
+        createdAt: now,
+      },
+    );
+    store.comms.unshift({
+      id: ++store.nextId,
+      reference,
+      channel: "email",
+      direction: "outbound",
+      subject: `Your cost plan — ${reference}`,
+      body: `Hi ${input.name.split(" ")[0]}, thanks for the detail. Here's your indicative range and what drives it. I'll follow up within one working day. — Jess`,
+      createdAt: now,
+    });
+    return row;
+  }
 
   const [row] = await db
     .insert(enquiries)
@@ -165,6 +239,21 @@ export async function createEnquiryEvent(
   enquiryId: number,
   ev: { kind: string; label: string; detail?: string; actor?: string; channel?: string; minutesAfter?: number },
 ) {
+  if (!hasDatabase) {
+    const store = getMemoryStore();
+    store.events.unshift({
+      id: ++store.nextId,
+      enquiryId,
+      kind: ev.kind,
+      label: ev.label,
+      detail: ev.detail ?? "",
+      actor: ev.actor ?? "Studio desk",
+      channel: ev.channel ?? "system",
+      minutesAfter: ev.minutesAfter ?? 0,
+      createdAt: new Date(),
+    });
+    return;
+  }
   await db.insert(enquiryEvents).values({
     enquiryId,
     kind: ev.kind,
@@ -177,6 +266,9 @@ export async function createEnquiryEvent(
 }
 
 export async function getEnquiries(limit = 12) {
+  if (!hasDatabase) {
+    return getMemoryStore().enquiries.slice(0, limit);
+  }
   try {
     return await db.select().from(enquiries).orderBy(desc(enquiries.createdAt)).limit(limit);
   } catch {
@@ -185,6 +277,16 @@ export async function getEnquiries(limit = 12) {
 }
 
 export async function getDeskStats() {
+  if (!hasDatabase) {
+    const rows = getMemoryStore().enquiries.map((e) => ({
+      stage: e.stage,
+      status: e.status,
+      score: e.score,
+      grade: e.grade,
+    }));
+    const avg = rows.length > 0 ? Math.round(rows.reduce((n, r) => n + r.score, 0) / rows.length) : 0;
+    return { rows, avg };
+  }
   try {
     const rows = await db
       .select({ stage: enquiries.stage, status: enquiries.status, score: enquiries.score, grade: enquiries.grade })
@@ -200,6 +302,25 @@ export async function getDeskStats() {
 }
 
 export async function getRecentEvents(limit = 8) {
+  if (!hasDatabase) {
+    const store = getMemoryStore();
+    return store.events.slice(0, limit).map((ev) => {
+      const enq = store.enquiries.find((e) => e.id === ev.enquiryId);
+      return {
+        id: ev.id,
+        kind: ev.kind,
+        label: ev.label,
+        detail: ev.detail,
+        actor: ev.actor,
+        channel: ev.channel,
+        minutesAfter: ev.minutesAfter,
+        createdAt: ev.createdAt,
+        reference: enq?.reference ?? null,
+        suburb: enq?.suburb ?? null,
+        projectType: enq?.projectType ?? null,
+      };
+    });
+  }
   try {
     const rows = await db
       .select({
@@ -235,6 +356,46 @@ export async function createBooking(input: {
   notes?: string;
 }) {
   const reference = `SV-${Math.floor(1000 + Math.random() * 8999)}`;
+  if (!hasDatabase) {
+    const store = getMemoryStore();
+    const now = new Date();
+    const row = {
+      id: ++store.nextId,
+      reference,
+      name: input.name,
+      email: input.email,
+      phone: input.phone ?? "",
+      suburb: input.suburb ?? "",
+      visitType: input.visitType ?? "Site visit",
+      slotIso: input.slotIso,
+      durationMinutes: 90,
+      notes: input.notes ?? "",
+      status: "confirmed",
+      createdAt: now,
+    };
+    store.bookings.push(row);
+    store.events.unshift({
+      id: ++store.nextId,
+      enquiryId: 0,
+      kind: "human",
+      label: `Site visit booked — ${row.slotIso.slice(0, 10)}`,
+      detail: `${input.name} booked a ${input.visitType ?? "site visit"}. Confirmation, prep pack and reminder scheduled.`,
+      actor: input.name,
+      channel: "web",
+      minutesAfter: 0,
+      createdAt: now,
+    });
+    store.comms.unshift({
+      id: ++store.nextId,
+      reference,
+      channel: "email",
+      direction: "outbound",
+      subject: `Confirmed — ${input.visitType ?? "Site visit"} on ${new Date(input.slotIso).toLocaleDateString("en-AU")}`,
+      body: `You're locked in for 90 minutes. Here's what we'll look at together and what to have ready.`,
+      createdAt: now,
+    });
+    return row;
+  }
   const [row] = await db
     .insert(bookings)
     .values({
@@ -281,6 +442,9 @@ export async function createBooking(input: {
 }
 
 export async function getBookings() {
+  if (!hasDatabase) {
+    return [...getMemoryStore().bookings].sort((a, b) => a.slotIso.localeCompare(b.slotIso));
+  }
   try {
     return await db.select().from(bookings).orderBy(asc(bookings.slotIso));
   } catch {
@@ -289,6 +453,9 @@ export async function getBookings() {
 }
 
 export async function slotTaken(slotIso: string) {
+  if (!hasDatabase) {
+    return getMemoryStore().bookings.some((b) => b.slotIso === slotIso && b.status === "confirmed");
+  }
   try {
     const rows = await db
       .select({ id: bookings.id })
@@ -302,6 +469,7 @@ export async function slotTaken(slotIso: string) {
 }
 
 export async function logChat(sessionId: string, role: string, content: string, intent = "") {
+  if (!hasDatabase) return;
   try {
     await db.insert(chatTurns).values({ sessionId, role, content, intent });
   } catch {
@@ -316,6 +484,19 @@ export async function logComms(entry: {
   subject?: string;
   body?: string;
 }) {
+  if (!hasDatabase) {
+    const store = getMemoryStore();
+    store.comms.unshift({
+      id: ++store.nextId,
+      reference: entry.reference ?? "",
+      channel: entry.channel,
+      direction: entry.direction ?? "outbound",
+      subject: entry.subject ?? "",
+      body: entry.body ?? "",
+      createdAt: new Date(),
+    });
+    return;
+  }
   try {
     await db.insert(commsLog).values({
       reference: entry.reference ?? "",
@@ -330,6 +511,9 @@ export async function logComms(entry: {
 }
 
 export async function getComms(limit = 6) {
+  if (!hasDatabase) {
+    return getMemoryStore().comms.slice(0, limit);
+  }
   try {
     return await db.select().from(commsLog).orderBy(desc(commsLog.id)).limit(limit);
   } catch {
@@ -338,6 +522,9 @@ export async function getComms(limit = 6) {
 }
 
 export async function countProjects() {
+  if (!hasDatabase) {
+    return getMemoryStore().projects.length;
+  }
   try {
     const rows = await db.execute<{ count: string }>(sql`select count(*)::text as count from projects`);
     const list = (rows as unknown as { rows?: { count: string }[] }).rows ?? [];
